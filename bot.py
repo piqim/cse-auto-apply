@@ -2,15 +2,14 @@
 """
 Handshake Internship Auto-Applicator v2
 ----------------------------------------
-Scrapes Handshake for internship postings, scores each one against your
-profile using Groq (LLaMA 3.3 70B), auto-fills free-text questions, attaches
-your resume, and submits. Every outcome gets logged to a CSV.
+Scrapes Handshake for internship postings, applies to each one, and uses
+Groq (LLaMA 3.3 70B) only when needed — to write cover letters and answer
+free-text questions during the application. Every outcome gets logged to a CSV.
 
 Setup:
   1. pip install -r requirements.txt && playwright install chromium
   2. Get a free Groq key at https://console.groq.com
-  3. Drop your resume in this folder, update RESUME_PATH below
-  4. python bot.py — log in via SSO when the browser opens, then press ENTER
+  3. python bot.py — log in via SSO when the browser opens, then press ENTER
 """
 
 import asyncio
@@ -18,13 +17,15 @@ import csv
 import json
 import os
 import sys
+import time
 import urllib.request
 import urllib.error
 from datetime import datetime
 from pathlib import Path
 
-from playwright.async_api import async_playwright, Page, TimeoutError as PlaywrightTimeout
 from dotenv import load_dotenv
+
+from playwright.async_api import async_playwright, Page, TimeoutError as PlaywrightTimeout
 
 
 # ── CONFIG ────────────────────────────────────────────────────────────────────
@@ -35,8 +36,6 @@ load_dotenv()
 
 # Free key at https://console.groq.com — or set via: export GROQ_API_KEY='gsk_...'
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "YOUR_API_KEY_HERE")
-
-RESUME_PATH = "resume.pdf"
 
 # What to search on Handshake. Each keyword runs as its own search.
 KEYWORDS = [
@@ -50,22 +49,22 @@ KEYWORDS = [
     "data analyst",
     "backend engineer",
     "frontend engineer",
+    "AI engineer",
+    "artificial intelligence",
 ]
 
 # Jobs scoring below this (out of 10) get skipped. Raise it to be picky,
 # lower it if you want to cast a wider net.
-MIN_RELEVANCE_SCORE = 6
-
 MAX_APPLICATIONS   = 25     # hard stop — won't submit more than this per run
+MAX_PAGES          = 5      # pages to scrape per keyword (25 results each = up to 125 per keyword)
 DELAY_BETWEEN_APPS = 4      # seconds between each application, don't be rude
 TRACKER_FILE       = "applied_jobs.csv"
-DRY_RUN            = False  # set True to scrape + score without submitting
+DRY_RUN            = False  # set True to scrape without submitting
 
 
 # ── CANDIDATE PROFILE ─────────────────────────────────────────────────────────
-# Plain-text summary of who you are. Groq reads this to score job fit and write
-# cover letter answers. The more honest and detailed it is, the better the output.
-# Replace this with your own profile if you're not me.
+# Groq uses this to write cover letters and answer free-text questions.
+# The more accurate it is, the better the output. Replace with your own if needed.
 
 CANDIDATE_PROFILE = """
 Name        : Mustaqim Bin Burhanuddin (goes by Piqim)
@@ -191,11 +190,7 @@ comes back sharper every time.
 
 # Base Handshake job search URL, pre-filtered to Internships only.
 # Each keyword search appends &query=... to this.
-HANDSHAKE_JOBS_URL = (
-    "https://app.joinhandshake.com/ecs/jobs"
-    "?page=1&per_page=25&sort_direction=desc&sort_column=default"
-    "&job.job_type_names[]=Internship"
-)
+HANDSHAKE_BASE_URL = "https://ucsd.joinhandshake.com"
 
 # Groq uses OpenAI's API format — same request shape, different URL + key.
 GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
@@ -228,10 +223,8 @@ def llm(system: str, user: str, max_tokens: int = 500) -> str:
     """
     Send a prompt to Groq and return the response text.
 
-    Groq's API is OpenAI-compatible, so the request body uses the same
-    messages array format: a system message sets the context/persona,
-    and the user message is the actual task. We use urllib here to avoid
-    pulling in an extra SDK dependency — the API is simple enough.
+    Groq's free tier caps at 12,000 tokens/minute. On a 429 rate limit error,
+    we wait and retry up to 3 times with increasing delays before giving up.
     """
     payload = json.dumps({
         "model":      GROQ_MODEL,
@@ -248,53 +241,32 @@ def llm(system: str, user: str, max_tokens: int = 500) -> str:
         headers={
             "Content-Type":  "application/json",
             "Authorization": f"Bearer {GROQ_API_KEY}",
+            # Cloudflare blocks requests with no User-Agent (treats them as bots)
+            "User-Agent":    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
         },
     )
-    try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            data = json.loads(resp.read())
-            return data["choices"][0]["message"]["content"].strip()
-    except urllib.error.HTTPError as e:
-        err(f"Groq API error {e.code}: {e.read().decode()[:200]}")
-        return ""
-    except Exception as e:
-        err(f"Groq API exception: {e}")
-        return ""
 
+    # Retry up to 3 times on rate limit — waits grow: 15s, 30s, 60s
+    for attempt in range(3):
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                data = json.loads(resp.read())
+                return data["choices"][0]["message"]["content"].strip()
+        except urllib.error.HTTPError as e:
+            body = e.read().decode()
+            if e.code == 429:
+                wait = 15 * (2 ** attempt)   # 15s, 30s, 60s
+                warn(f"Groq rate limit hit — waiting {wait}s before retry ({attempt + 1}/3)")
+                time.sleep(wait)
+            else:
+                err(f"Groq API error {e.code}: {body[:200]}")
+                return ""
+        except Exception as e:
+            err(f"Groq API exception: {e}")
+            return ""
 
-# ── SCORING ───────────────────────────────────────────────────────────────────
-
-def score_job(title: str, company: str, description: str) -> tuple[int, str]:
-    """
-    Ask Groq to rate how well a job matches the candidate profile.
-    Returns a (score, rationale) tuple — score is 1-10, rationale is one sentence.
-
-    We tell the model to respond in raw JSON only (no markdown fences) so we
-    can parse it directly. If parsing fails for whatever reason, score defaults
-    to 0 so the job gets skipped rather than accidentally applied to.
-    """
-    system = f"""You are a career advisor evaluating job-candidate fit.
-Given the candidate profile and a job posting, output ONLY a JSON object
-(no markdown fences) with exactly two fields:
-  "score"     : integer 1-10 (10 = perfect match)
-  "rationale" : one sentence explaining the score
-
-Candidate profile:
-{CANDIDATE_PROFILE}
-"""
-    user = f"""Job Title   : {title}
-Company     : {company}
-Description :
-{description[:1500]}
-"""
-    raw = llm(system, user, max_tokens=120)
-    try:
-        # Strip markdown fences in case the model adds them anyway
-        clean = raw.replace("```json", "").replace("```", "").strip()
-        obj   = json.loads(clean)
-        return int(obj.get("score", 0)), obj.get("rationale", "")
-    except Exception:
-        return 0, f"Could not parse score (raw: {raw[:80]})"
+    err("Groq rate limit — all retries exhausted, skipping this call")
+    return ""
 
 
 # ── ANSWER GENERATION ─────────────────────────────────────────────────────────
@@ -356,14 +328,13 @@ class Tracker:
     def already_applied(self, job_id: str) -> bool:
         return job_id in self.applied
 
-    def record(self, job_id: str, title: str, company: str,
-               status: str, score: int = 0):
+    def record(self, job_id: str, title: str, company: str, status: str):
         """Append a new row to the CSV and add the ID to the in-memory set."""
         self.applied.add(job_id)
         exists = self.path.exists()
         with open(self.path, "a", newline="") as f:
             writer = csv.DictWriter(f, fieldnames=[
-                "job_id", "title", "company", "score", "status", "applied_at"
+                "job_id", "title", "company", "status", "applied_at"
             ])
             if not exists:
                 writer.writeheader()
@@ -371,7 +342,6 @@ class Tracker:
                 "job_id":     job_id,
                 "title":      title,
                 "company":    company,
-                "score":      score,
                 "status":     status,
                 "applied_at": datetime.now().isoformat(),
             })
@@ -381,53 +351,83 @@ class Tracker:
 
 async def search_jobs(page: Page, keyword: str) -> list[dict]:
     """
-    Search Handshake for a keyword and return a list of job dicts.
+    Search Handshake for a keyword across multiple pages and return all job dicts.
 
-    Handshake renders job cards as <a> tags with hrefs like /jobs/12345678.
-    We grab all matching anchors, pull the numeric ID from the href, and
-    extract the title and company from the card's inner text.
-    Deduplication happens here within a single keyword search — cross-keyword
-    deduplication happens in run().
+    From the HTML we know:
+    - Job cards are elements with data-hook="job-result-card | {id}"
+    - The job ID is after the pipe in that attribute
+    - Title comes from the <a> tag's aria-label: "View {title}" → strip "View "
+    - Company comes from the <img alt="{company}"> inside the card
+
+    Pagination: loops up to MAX_PAGES. Stops early if a page returns fewer
+    cards than per_page (meaning we've hit the last page of results).
     """
-    search_url = (
-        f"{HANDSHAKE_JOBS_URL}"
-        f"&query={keyword.replace(' ', '+')}"
-    )
-    info(f"Searching: \"{keyword}\"")
-    await page.goto(search_url, wait_until="networkidle", timeout=30_000)
-    await page.wait_for_timeout(2000)
-
+    per_page  = 25
     jobs: list[dict] = []
     seen_ids: set[str] = set()
-    cards = await page.query_selector_all("a[href*='/jobs/']")
 
-    for card in cards:
-        href  = await card.get_attribute("href") or ""
+    for page_num in range(1, MAX_PAGES + 1):
+        search_url = (
+            f"{HANDSHAKE_BASE_URL}/job-search"
+            f"?jobType=3&per_page={per_page}&page={page_num}"
+            f"&query={keyword.replace(' ', '+')}"
+        )
 
-        # Pull the job ID — it's the last numeric segment in the href path
-        parts  = [p for p in href.split("/") if p.isdigit()]
-        if not parts:
-            continue
-        job_id = parts[-1]
-        if job_id in seen_ids:
-            continue
-        seen_ids.add(job_id)
+        if page_num == 1:
+            info(f"Searching: \"{keyword}\"")
+        else:
+            info(f"  Page {page_num}: \"{keyword}\"")
 
-        # Card text is usually "Job Title\nCompany Name\n..." — first two lines
-        text    = (await card.inner_text()).strip().split("\n")
-        title   = text[0].strip() if text else "Unknown Title"
-        company = text[1].strip() if len(text) > 1 else "Unknown Company"
+        await page.goto(search_url, wait_until="domcontentloaded", timeout=30_000)
 
-        jobs.append({
-            "id":          job_id,
-            "title":       title,
-            "company":     company,
-            "url":         f"https://app.joinhandshake.com{href}",
-            "score":       0,
-            "description": "",
-        })
+        try:
+            await page.wait_for_selector(
+                "[data-hook^='job-result-card | ']", timeout=10_000
+            )
+        except PlaywrightTimeout:
+            if page_num == 1:
+                warn(f"No job cards loaded for \"{keyword}\" — skipping")
+            break   # no cards on this page, we've gone past the last page
 
-    ok(f"Found {len(jobs)} internship(s) for \"{keyword}\"")
+        await page.wait_for_timeout(500)
+
+        cards        = await page.query_selector_all("[data-hook^='job-result-card | ']")
+        cards_found  = 0
+
+        for card in cards:
+            hook   = await card.get_attribute("data-hook") or ""
+            job_id = hook.split("|")[-1].strip()
+            if not job_id.isdigit() or job_id in seen_ids:
+                continue
+            seen_ids.add(job_id)
+            cards_found += 1
+
+            # Title: <a aria-label="View AI Engineering Intern"> → strip "View "
+            title   = "Unknown Title"
+            link_el = await card.query_selector("a[aria-label^='View ']")
+            if link_el:
+                aria  = await link_el.get_attribute("aria-label") or ""
+                title = aria.removeprefix("View ").strip()
+
+            # Company: <img alt="CaterAI"> inside the card
+            company = "Unknown Company"
+            img_el  = await card.query_selector("img[alt]")
+            if img_el:
+                company = (await img_el.get_attribute("alt") or "").strip()
+
+            jobs.append({
+                "id":          job_id,
+                "title":       title,
+                "company":     company,
+                "url":         f"{HANDSHAKE_BASE_URL}/job-search/{job_id}",
+                "description": "",
+            })
+
+        # Fewer results than a full page means this was the last page
+        if cards_found < per_page:
+            break
+
+    ok(f"Found {len(jobs)} internship(s) for \"{keyword}\" ({page_num} page(s))")
     return jobs
 
 
@@ -435,17 +435,15 @@ async def get_job_description(page: Page, url: str) -> str:
     """
     Navigate to a job page and return the description text.
 
-    Handshake doesn't use a consistent class name for the description container,
-    so we try a few selectors in order of specificity and take the first one
-    that returns meaningful content (>80 chars). Falls back to empty string
-    if nothing works — the job will still get scored, just with less context.
+    The job detail panel is in data-hook="right-content".
+    Falls back to broader selectors if that's empty.
     """
     try:
-        await page.goto(url, wait_until="networkidle", timeout=30_000)
-        await page.wait_for_timeout(1000)
+        await page.goto(url, wait_until="domcontentloaded", timeout=30_000)
+        await page.wait_for_timeout(1500)
         for sel in [
+            "[data-hook='right-content']",
             "[data-hook='job-description']",
-            ".job-description",
             "[class*='description']",
             "article",
             "main",
@@ -454,10 +452,53 @@ async def get_job_description(page: Page, url: str) -> str:
             if el:
                 text = (await el.inner_text()).strip()
                 if len(text) > 80:
-                    return text[:2000]   # cap at 2000 chars — enough for scoring
+                    return text[:2000]
         return ""
     except Exception:
         return ""
+
+
+# ── COVER LETTER ─────────────────────────────────────────────────────────────
+
+def generate_cover_letter(title: str, company: str, description: str) -> str:
+    """
+    Generate a full cover letter for jobs that ask for one as a file upload.
+
+    Unlike generate_answer() which writes 2-4 sentences for a specific question,
+    this writes a proper 3-paragraph cover letter: intro, body (relevant
+    experience), and close. Still keeps it tight — recruiters don't read essays.
+    """
+    system = f"""You write cover letters on behalf of a job applicant.
+Write in first person as Mustaqim (Piqim). Three short paragraphs:
+  1. Why this role and company specifically — be concrete, not generic
+  2. Two or three most relevant experiences/projects from the profile
+  3. Brief close — what you'd bring and enthusiasm to discuss further
+No "Dear Hiring Manager" header needed. No hollow phrases like
+"I am passionate about". Where natural, mention that Piqim built an
+automated Handshake application bot — evidence of how he approaches problems.
+Confident, specific, human. Keep it under 250 words total.
+
+Candidate profile:
+{CANDIDATE_PROFILE}
+"""
+    user = f"""Job Title   : {title}
+Company     : {company}
+Description : {description[:800]}
+"""
+    return llm(system, user, max_tokens=400)
+
+
+def save_cover_letter(title: str, company: str, content: str) -> str:
+    """
+    Save cover letter text to a temp .txt file and return the file path.
+    Handshake accepts plain text files for document uploads.
+    """
+    import tempfile
+    safe_company = "".join(c for c in company if c.isalnum() or c in " _-")[:30]
+    filename = f"cover_letter_{safe_company}.txt".replace(" ", "_")
+    path = Path(tempfile.gettempdir()) / filename
+    path.write_text(content, encoding="utf-8")
+    return str(path)
 
 
 # ── APPLICATOR ────────────────────────────────────────────────────────────────
@@ -528,19 +569,14 @@ async def fill_text_fields(page: Page, title: str, company: str,
     return filled
 
 
-async def apply_to_job(page: Page, job: dict, resume_path: str) -> str:
+async def apply_to_job(page: Page, job: dict) -> str:
     """
     Attempt to apply to a single job. Returns a status string.
-
-    Handshake's apply flow is multi-step — usually 2-4 pages in a modal.
-    We loop up to 6 times, handling resume uploads and free-text fields on each
-    step before clicking Next/Continue/Submit. The loop exits when we hit a
-    Submit button or can't find a next button to click.
 
     Possible return values:
       applied               — confirmed success
       submitted_unconfirmed — submitted but couldn't find a confirmation element
-      already_applied       — Handshake showed "Applied" before we even clicked
+      already_applied       — Handshake showed an applied state before clicking
       no_apply_button       — couldn't find an Apply button on the page
       external              — job links to an external site, can't auto-apply
       dry_run               — DRY_RUN is True, skipped submission
@@ -548,71 +584,175 @@ async def apply_to_job(page: Page, job: dict, resume_path: str) -> str:
       error                 — something unexpected broke
     """
     try:
-        # Navigate to the job page if we're not already there
+        # Navigate using the same URL pattern Handshake uses internally
+        job_url = f"{HANDSHAKE_BASE_URL}/job-search/{job['id']}?page=1&per_page=25"
         if job["id"] not in page.url:
-            await page.goto(job["url"], wait_until="networkidle", timeout=30_000)
-            await page.wait_for_timeout(1500)
+            await page.goto(job_url, wait_until="domcontentloaded", timeout=30_000)
 
-        if await page.query_selector("text=Applied"):
+        # ── Wait for the right panel to fully render ──────────────────────────
+        # The job detail panel (right column) loads asynchronously after the
+        # left job list renders. We specifically wait for the Apply button
+        # inside the right-content panel, not just any button on the page.
+        try:
+            await page.wait_for_selector(
+                "[data-hook='right-content'] button[aria-label='Apply'],"
+                "[data-hook='right-content'] button[aria-label^='Apply to']",
+                timeout=10_000,
+            )
+        except PlaywrightTimeout:
+            # Right panel didn't render — fall back to a broader wait
+            await page.wait_for_timeout(3000)
+
+        # ── Check if already applied ──────────────────────────────────────────
+        if await page.query_selector("button[aria-label='Cancel application']"):
             return "already_applied"
 
-        apply_btn = (
-            await page.query_selector("button:has-text('Apply')")
-            or await page.query_selector("a:has-text('Apply')")
-        )
+        # ── Locate the Apply button ───────────────────────────────────────────
+        # Prefer the button inside the right-content panel. There are two Apply
+        # buttons on the page (panel header + floating sticky bar), so we use
+        # .first to avoid a strict-mode violation.
+        #
+        # Priority order:
+        #   1. Exact aria-label="Apply" inside right-content
+        #   2. Starts-with aria-label="Apply to …" inside right-content
+        #   3. Any visible button whose inner text is exactly "Apply"
+        apply_btn = None
+
+        for selector in [
+            "[data-hook='right-content'] button[aria-label='Apply']",
+            "[data-hook='right-content'] button[aria-label^='Apply to']",
+            "button[aria-label='Apply']",
+            "button[aria-label^='Apply to']",
+        ]:
+            els = await page.query_selector_all(selector)
+            for el in els:
+                if await el.is_visible():
+                    apply_btn = el
+                    break
+            if apply_btn:
+                break
+
+        # Last resort: find any visible button whose text content is "Apply"
+        if not apply_btn:
+            buttons = await page.query_selector_all("button")
+            for btn in buttons:
+                text = (await btn.inner_text()).strip()
+                if text == "Apply" and await btn.is_visible():
+                    apply_btn = btn
+                    break
+
         if not apply_btn:
             return "no_apply_button"
 
+        # ── Check for external-link indicators ───────────────────────────────
+        btn_aria = (await apply_btn.get_attribute("aria-label") or "").lower()
         btn_text = (await apply_btn.inner_text()).strip().lower()
-        if "external" in btn_text or "website" in btn_text:
+        if "external" in btn_aria or "website" in btn_aria:
+            return "external"
+
+        # Some jobs show an "Apply on company website" button as the main CTA
+        if "website" in btn_text or "company site" in btn_text:
             return "external"
 
         if DRY_RUN:
             return "dry_run"
 
+        # ── Click Apply and wait for the modal ────────────────────────────────
         await apply_btn.click()
-        await page.wait_for_timeout(2000)
 
-        # Step through the multi-page application modal
-        for step in range(6):
-
-            # Attach resume if a file upload input is present on this step
-            file_input = await page.query_selector("input[type='file']")
-            if file_input and Path(resume_path).exists():
-                await file_input.set_input_files(resume_path)
-                await page.wait_for_timeout(1000)
-                ok(f"  Resume attached (step {step + 1})")
-
-            # Fill any open-ended text fields on this step
-            filled = await fill_text_fields(
-                page, job["title"], job["company"], job["description"]
+        try:
+            await page.wait_for_selector(
+                "[data-hook='apply-modal-content']", timeout=8_000
             )
-            if filled:
-                ai(f"  Groq answered {filled} question(s)")
+        except PlaywrightTimeout:
+            # Modal never appeared — Handshake may have opened an external link
+            # or the click didn't register properly
+            return "no_modal"
 
-            # Find the button to advance — could be Next, Continue, or Submit
-            next_btn = (
-                await page.query_selector("button:has-text('Next')")
-                or await page.query_selector("button:has-text('Continue')")
-                or await page.query_selector("button:has-text('Submit')")
-                or await page.query_selector("button:has-text('Apply')")
+        await page.wait_for_timeout(1000)   # let modal fully paint
+
+        # ── Cover letter (optional) ───────────────────────────────────────────
+        cover_letter_input = await page.evaluate("""
+            () => {
+                const fieldsets = document.querySelectorAll(
+                    '[data-hook="apply-modal-content"] fieldset'
+                );
+                for (const fs of fieldsets) {
+                    const legend = fs.querySelector('legend');
+                    if (legend && legend.innerText.toLowerCase().includes('cover letter')) {
+                        const input = fs.querySelector('input[type="file"]');
+                        return input ? true : false;
+                    }
+                }
+                return false;
+            }
+        """)
+
+        if cover_letter_input:
+            ai(f"  Cover letter required — generating...")
+            cl_text = generate_cover_letter(
+                job["title"], job["company"], job["description"]
             )
-            if not next_btn:
-                break   # no button found, assume we're done
+            if cl_text:
+                cl_path = save_cover_letter(job["title"], job["company"], cl_text)
+                cl_file_input = await page.evaluate("""
+                    () => {
+                        const fieldsets = document.querySelectorAll(
+                            '[data-hook="apply-modal-content"] fieldset'
+                        );
+                        for (const fs of fieldsets) {
+                            const legend = fs.querySelector('legend');
+                            if (legend && legend.innerText.toLowerCase().includes('cover letter')) {
+                                const input = fs.querySelector('input[type="file"]');
+                                if (input) {
+                                    input.style.display = 'block';
+                                    input.style.opacity = '1';
+                                    return true;
+                                }
+                            }
+                        }
+                        return false;
+                    }
+                """)
+                if cl_file_input:
+                    file_input = await page.query_selector(
+                        "[data-hook='apply-modal-content'] fieldset input[type='file']"
+                    )
+                    if file_input:
+                        await file_input.set_input_files(cl_path)
+                        await page.wait_for_timeout(1000)
+                        ok(f"  Cover letter uploaded")
 
-            btn_label = (await next_btn.inner_text()).strip().lower()
-            await next_btn.click()
-            await page.wait_for_timeout(2000)
+        # ── Free-text questions ───────────────────────────────────────────────
+        filled = await fill_text_fields(
+            page, job["title"], job["company"], job["description"]
+        )
+        if filled:
+            ai(f"  Groq answered {filled} question(s)")
 
-            if "submit" in btn_label or "apply" in btn_label:
-                break   # that was the final step
+        # ── Submit ────────────────────────────────────────────────────────────
+        # Try the most specific selector first, then broaden
+        submit_btn = None
+        for selector in [
+            "[data-hook='apply-modal-content'] button:has-text('Submit Application')",
+            "[data-hook='apply-modal-content'] button:has-text('Submit')",
+            "[data-hook='apply-modal-content'] button:has-text('Apply')",
+        ]:
+            submit_btn = await page.query_selector(selector)
+            if submit_btn and await submit_btn.is_visible():
+                break
 
-        # Check for a success indicator — Handshake isn't consistent about this
+        if not submit_btn:
+            return "no_submit_button"
+
+        await submit_btn.click()
+        await page.wait_for_timeout(2500)   # give Handshake time to process
+
+        # ── Confirm success ───────────────────────────────────────────────────
         success = (
-            await page.query_selector("text=Application submitted")
+            await page.query_selector("button[aria-label='Cancel application']")
+            or await page.query_selector("text=Application submitted")
             or await page.query_selector("text=Successfully applied")
-            or await page.query_selector("text=Applied")
-            or await page.query_selector("[class*='success']")
         )
         return "applied" if success else "submitted_unconfirmed"
 
@@ -622,7 +762,6 @@ async def apply_to_job(page: Page, job: dict, resume_path: str) -> str:
         err(f"  Exception on {job['url']}: {ex}")
         return "error"
 
-
 # ── MAIN ──────────────────────────────────────────────────────────────────────
 
 async def run():
@@ -631,20 +770,14 @@ async def run():
       1. Validate config
       2. Open browser, wait for manual SSO login
       3. Scrape all keywords, deduplicate results
-      4. Fetch each job's description and score it against the profile
-      5. Sort by score, apply to everything above MIN_RELEVANCE_SCORE
-      6. Print summary, close browser
+      4. Apply to each new job — Groq fires only when the modal needs a cover letter or question answered
+      5. Print summary, close browser
     """
 
     if GROQ_API_KEY == "YOUR_API_KEY_HERE":
         err("Set your GROQ_API_KEY before running.")
         err("  Get a free key at: https://console.groq.com")
         err("  Then: export GROQ_API_KEY='gsk_...'")
-        sys.exit(1)
-
-    resume = Path(RESUME_PATH)
-    if not resume.exists():
-        err(f"Resume not found at '{RESUME_PATH}'. Update RESUME_PATH in bot.py.")
         sys.exit(1)
 
     tracker = Tracker(TRACKER_FILE)
@@ -654,9 +787,7 @@ async def run():
 ║       Handshake Internship Auto-Applicator  v2               ║
 ║  + Groq-powered cover letters & job relevance scoring        ║
 ╚══════════════════════════════════════════════════════════════╝{RESET}
-  Resume       : {resume.resolve()}
-  Keywords     : {len(KEYWORDS)} terms
-  Min score    : {MIN_RELEVANCE_SCORE}/10
+  Keywords     : {len(KEYWORDS)} terms (up to {MAX_PAGES} pages each)
   Max apps     : {MAX_APPLICATIONS}
   Dry run      : {DRY_RUN}
   Tracker      : {TRACKER_FILE}
@@ -668,16 +799,30 @@ async def run():
         context = await browser.new_context()
         page    = await context.new_page()
 
-        # SSO login is manual — every university's flow is different and most
-        # use MFA, so there's no clean way to automate this part
-        await page.goto("https://app.joinhandshake.com/login")
+        # SSO login is manual — UCSD routes through DUO which can take a while.
+        # Instead of relying on the user pressing ENTER at the right moment,
+        # we just poll every 10 seconds until a tab lands on the dashboard.
+        await page.goto(f"{HANDSHAKE_BASE_URL}/login")
         print(f"{YELLOW}{BOLD}  ➤  A browser window has opened.")
-        print(f"  ➤  Log in with your university SSO.")
-        print(f"  ➤  Once you see your Handshake dashboard, return here.")
-        input(f"\n  Press ENTER when you're logged in...{RESET}\n")
+        print(f"  ➤  Log in with your UCSD SSO and complete DUO authentication.")
+        print(f"  ➤  The bot will detect when you're on the dashboard automatically.{RESET}\n")
 
-        if "login" in page.url or "sign_in" in page.url:
-            err("Still on the login page — please try again.")
+        # Wait up to 5 minutes total. 10 second intervals keeps it responsive
+        # without hammering context.pages in a tight loop.
+        page = None
+        for attempt in range(30):
+            page = next(
+                (p for p in context.pages
+                 if "joinhandshake.com" in p.url and "login" not in p.url),
+                None
+            )
+            if page:
+                break
+            info(f"Not logged in yet — checking again in 10 seconds... ({attempt + 1}/30)")
+            await asyncio.sleep(10)
+
+        if not page:
+            err("Timed out after 5 minutes. Run the bot again and complete login faster.")
             await browser.close()
             return
 
@@ -696,77 +841,55 @@ async def run():
                     seen_ids.add(job["id"])
                     all_jobs.append(job)
 
-        info(f"Total unique internships found: {len(all_jobs)}")
-        info("Fetching descriptions and scoring against your profile...\n")
+        # Filter out already-applied jobs before starting
+        pending = [j for j in all_jobs if not tracker.already_applied(j["id"])]
+        skipped_count = len(all_jobs) - len(pending)
+        if skipped_count:
+            info(f"Skipping {skipped_count} already-applied job(s)")
 
-        # Score every job we haven't applied to before.
-        # Jobs below MIN_RELEVANCE_SCORE get logged as "low_score" and skipped.
-        scored_jobs: list[dict] = []
-
-        for job in all_jobs:
-            if tracker.already_applied(job["id"]):
-                warn(f"Already applied — skip: {job['title']} @ {job['company']}")
-                continue
-
-            description        = await get_job_description(page, job["url"])
-            job["description"] = description
-            score, rationale   = score_job(job["title"], job["company"], description)
-            job["score"]       = score
-            job["rationale"]   = rationale
-
-            color = GREEN if score >= MIN_RELEVANCE_SCORE else YELLOW
-            print(f"{color}{BOLD}  [{score:2}/10]{RESET}  {job['title']} @ {job['company']}")
-
-            if score < MIN_RELEVANCE_SCORE:
-                warn(f"         Below threshold — {rationale}")
-                tracker.record(job["id"], job["title"], job["company"], "low_score", score)
-            else:
-                ai(f"         {rationale}")
-                scored_jobs.append(job)
-
-        # Apply to best matches first
-        scored_jobs.sort(key=lambda j: j["score"], reverse=True)
-
-        print(f"\n{CYAN}{BOLD}  {len(scored_jobs)} job(s) cleared the bar "
-              f"(≥{MIN_RELEVANCE_SCORE}/10). Starting applications...{RESET}\n")
+        info(f"{len(pending)} new internship(s) to apply to. Starting...\n")
 
         applied_count  = 0
-        skipped_count  = 0
         external_count = 0
         error_count    = 0
 
-        for job in scored_jobs:
+        for job in pending:
             if applied_count >= MAX_APPLICATIONS:
                 warn(f"Hit the MAX_APPLICATIONS limit ({MAX_APPLICATIONS}). Stopping.")
                 break
 
-            label = f"[{job['score']}/10] {job['title']} @ {job['company']}"
+            # Fetch the job description so Groq has context for cover letters
+            # and free-text answers during the application
+            job["description"] = await get_job_description(page, job["url"])
+
+            label = f"{job['title']} @ {job['company']}"
             info(f"Applying → {label}")
 
-            status = await apply_to_job(page, job, RESUME_PATH)
+            status = await apply_to_job(page, job)
 
             if status == "applied":
                 ok(f"Applied ✓  {label}")
-                tracker.record(job["id"], job["title"], job["company"], "applied", job["score"])
+                tracker.record(job["id"], job["title"], job["company"], "applied")
                 applied_count += 1
 
             elif status in ("submitted_unconfirmed", "dry_run"):
                 ok(f"Submitted  {label}")
-                tracker.record(job["id"], job["title"], job["company"], status, job["score"])
+                tracker.record(job["id"], job["title"], job["company"], status)
                 applied_count += 1
 
             elif status == "already_applied":
                 warn(f"Already applied: {label}")
+                tracker.record(job["id"], job["title"], job["company"], "already_applied")
                 skipped_count += 1
 
             elif status == "external":
                 warn(f"External link — apply manually: {label}")
-                tracker.record(job["id"], job["title"], job["company"], "external_link", job["score"])
+                tracker.record(job["id"], job["title"], job["company"], "external_link")
                 external_count += 1
 
             else:
                 err(f"Error ({status}): {label}")
-                tracker.record(job["id"], job["title"], job["company"], f"error:{status}", job["score"])
+                tracker.record(job["id"], job["title"], job["company"], f"error:{status}")
                 error_count += 1
 
             await asyncio.sleep(DELAY_BETWEEN_APPS)

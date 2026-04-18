@@ -1,0 +1,2 @@
+playwright>=1.44.0
+# Groq API is called via stdlib urllib — no extra SDK needed

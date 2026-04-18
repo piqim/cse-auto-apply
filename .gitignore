@@ -1,0 +1,13 @@
+.env
+.venv/
+__pycache__/
+*.pyc
+
+# Personal/sensitive local assets
+resume.pdf
+applied_jobs.csv
+
+# Local logs and OS/editor junk
+*.log
+.DS_Store
+Thumbs.db

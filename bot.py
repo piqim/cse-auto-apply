@@ -41,23 +41,23 @@ GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "YOUR_API_KEY_HERE")
 KEYWORDS = [
     "data science",
     "data engineering",
-    "software engineering",
-    "computer science",
-    "fullstack developer",
-    "developer",
-    "machine learning",
-    "data analyst",
-    "backend engineer",
-    "frontend engineer",
-    "AI engineer",
-    "artificial intelligence",
+    #"software engineering",
+    #"computer science",
+    #"fullstack developer",
+    #"developer",
+    #"machine learning",
+    #"data analyst",
+    #"backend engineer",
+    #"frontend engineer",
+    #"AI engineer",
+    #"artificial intelligence",
 ]
 
 # Jobs scoring below this (out of 10) get skipped. Raise it to be picky,
 # lower it if you want to cast a wider net.
 MAX_APPLICATIONS   = 25     # hard stop — won't submit more than this per run
 MAX_PAGES          = 5      # pages to scrape per keyword (25 results each = up to 125 per keyword)
-DELAY_BETWEEN_APPS = 4      # seconds between each application, don't be rude
+DELAY_BETWEEN_APPS = 2      # seconds between each application, don't be rude
 TRACKER_FILE       = "applied_jobs.csv"
 DRY_RUN            = False  # set True to scrape without submitting
 
@@ -511,6 +511,201 @@ QUESTION_SIGNALS = [
     "relevant", "qualif", "background", "about you",
 ]
 
+# Labels that indicate a file upload or URL field the bot cannot fill automatically.
+# Matched case-insensitively against the label text nearest to the field.
+MANUAL_UPLOAD_SIGNALS = [
+    "transcript", "resume", "cv", "portfolio", "writing sample",
+    "work sample", "reference", "letter of recommendation",
+]
+MANUAL_URL_SIGNALS = [
+    "github", "gitlab", "portfolio", "personal site", "website",
+    "linkedin", "behance", "dribbble",
+]
+
+
+async def detect_manual_fields(page: Page) -> list[str]:
+    """
+    Scan the open apply modal for fields the bot cannot fill automatically.
+    Returns a human-readable list of field descriptions so the user knows
+    exactly what to fill in before pressing ENTER.
+
+    Detects:
+      - File upload inputs whose label suggests a transcript, resume, portfolio, etc.
+        (cover letter uploads are handled automatically and are excluded here)
+      - Text/URL inputs whose label matches GitHub, portfolio, personal site, etc.
+      - Any visible required field that is still empty after the bot's auto-fill pass
+    """
+    modal = "[data-hook='apply-modal-content']"
+    needed: list[str] = []
+
+    # ── File uploads (non-cover-letter) ──────────────────────────────────────
+    file_inputs = await page.query_selector_all(f"{modal} input[type='file']")
+    for fi in file_inputs:
+        if not await fi.is_visible():
+            continue
+        label_text: str = await page.evaluate(
+            """el => {
+                let node = el;
+                for (let i = 0; i < 6; i++) {
+                    node = node.parentElement;
+                    if (!node) break;
+                    const lbl = node.querySelector('label, legend, p, span, h3, h4');
+                    if (lbl && lbl.innerText && lbl.innerText.trim().length > 2)
+                        return lbl.innerText.trim().toLowerCase();
+                }
+                return '';
+            }""",
+            fi,
+        )
+        # Skip if the file input lives inside a cover-letter fieldset (handled
+        # automatically by the cover-letter generation logic above).
+        # We check both the direct label text AND whether any ancestor fieldset
+        # has a "cover letter" legend — the "Upload new" button inside the
+        # cover-letter fieldset would otherwise be flagged as a manual upload.
+        in_cover_letter_fieldset: bool = await page.evaluate(
+            """el => {
+                let node = el;
+                while (node) {
+                    if (node.tagName === 'FIELDSET') {
+                        const legend = node.querySelector('legend');
+                        if (legend && legend.innerText.toLowerCase().includes('cover letter'))
+                            return true;
+                        break;
+                    }
+                    node = node.parentElement;
+                }
+                return false;
+            }""",
+            fi,
+        )
+        if in_cover_letter_fieldset or "cover letter" in label_text:
+            continue  # handled automatically
+
+        for sig in MANUAL_UPLOAD_SIGNALS:
+            if sig in label_text:
+                needed.append(f"\U0001f4ce File upload \u2014 \"{label_text[:60]}\"")
+                break
+        else:
+            needed.append(
+                f"\U0001f4ce File upload \u2014 \"{label_text[:60]}\"" if label_text
+                else "\U0001f4ce File upload (unlabeled)"
+            )
+
+    # ── URL / text inputs that need manual data ───────────────────────────────
+    text_inputs = await page.query_selector_all(
+        f"{modal} input[type='text'], {modal} input[type='url'], {modal} input:not([type])"
+    )
+    for ti in text_inputs:
+        if not await ti.is_visible():
+            continue
+        if (await ti.input_value()).strip():
+            continue
+        label_text: str = await page.evaluate(
+            """el => {
+                if (el.getAttribute('aria-label')) return el.getAttribute('aria-label').toLowerCase();
+                if (el.getAttribute('placeholder')) return el.getAttribute('placeholder').toLowerCase();
+                let node = el;
+                for (let i = 0; i < 6; i++) {
+                    node = node.parentElement;
+                    if (!node) break;
+                    const lbl = node.querySelector('label, legend, p, span, h3, h4');
+                    if (lbl && lbl.innerText && lbl.innerText.trim().length > 2)
+                        return lbl.innerText.trim().toLowerCase();
+                }
+                return '';
+            }""",
+            ti,
+        )
+        for sig in MANUAL_URL_SIGNALS:
+            if sig in label_text:
+                needed.append(f"\U0001f517 URL / text field \u2014 \"{label_text[:60]}\"")
+                break
+
+    # ── Required fields still empty ───────────────────────────────────────────
+    required_inputs = await page.query_selector_all(
+        f"{modal} input[required], {modal} textarea[required], "
+        f"{modal} input[aria-required='true'], {modal} textarea[aria-required='true']"
+    )
+    for ri in required_inputs:
+        if not await ri.is_visible():
+            continue
+        if (await ri.input_value()).strip():
+            continue
+        label_text: str = await page.evaluate(
+            """el => {
+                if (el.getAttribute('aria-label')) return el.getAttribute('aria-label');
+                if (el.getAttribute('placeholder')) return el.getAttribute('placeholder');
+                let node = el;
+                for (let i = 0; i < 6; i++) {
+                    node = node.parentElement;
+                    if (!node) break;
+                    const lbl = node.querySelector('label, legend, p, span, h3, h4');
+                    if (lbl && lbl.innerText && lbl.innerText.trim().length > 2)
+                        return lbl.innerText.trim();
+                }
+                return '(unlabeled required field)';
+            }""",
+            ri,
+        )
+        entry = f"\u26a0\ufe0f  Required field \u2014 \"{label_text[:60]}\""
+        if entry not in needed:
+            needed.append(entry)
+
+    return needed
+
+
+async def wait_for_enter_or_submit(page: Page) -> str:
+    """
+    Pause the bot and wait for one of two things:
+
+      1. User presses ENTER in the terminal after manually filling fields.
+         The bot then clicks Submit itself.
+
+      2. User clicks Submit/Apply in the browser themselves.
+         The bot detects the modal closing and skips its own Submit click.
+
+    Returns "bot_submits" or "user_submitted".
+    """
+    loop = asyncio.get_event_loop()
+
+    # Task A: wait for ENTER in the terminal (non-blocking via thread executor)
+    enter_future = loop.run_in_executor(None, sys.stdin.readline)
+    enter_task   = asyncio.ensure_future(asyncio.wrap_future(enter_future))
+
+    # Task B: poll the browser every 500 ms waiting for the modal to close.
+    # IMPORTANT: only check for success AFTER the modal is gone.
+    # The "Cancel application" button lives INSIDE the modal header and is
+    # always present while the modal is open — checking it before the modal
+    # closes would fire "user_submitted" instantly, before the user does anything.
+    async def watch_browser():
+        for _ in range(600):   # up to 5 minutes
+            modal_present = await page.query_selector("[data-hook='apply-modal-content']")
+            if not modal_present:
+                # Modal closed — check the main page for a success/applied state
+                right = "[data-hook='right-content']"
+                success = (
+                    await page.query_selector(f"{right} button:text('Withdraw application')")
+                    or await page.query_selector(f"{right} [role='alert'] h2")
+                    or await page.query_selector("text=Application submitted")
+                    or await page.query_selector("text=Successfully applied")
+                )
+                return "user_submitted" if success else "bot_submits"
+            await asyncio.sleep(0.5)
+        return "timeout"
+
+    browser_task = asyncio.ensure_future(watch_browser())
+
+    done, pending = await asyncio.wait(
+        [enter_task, browser_task],
+        return_when=asyncio.FIRST_COMPLETED,
+    )
+    for t in pending:
+        t.cancel()
+
+    winner = done.pop()
+    result = winner.result() if not winner.cancelled() else None
+    return "user_submitted" if result == "user_submitted" else "bot_submits"
+
 
 async def fill_text_fields(page: Page, title: str, company: str,
                             description: str) -> int:
@@ -569,6 +764,39 @@ async def fill_text_fields(page: Page, title: str, company: str,
     return filled
 
 
+async def _is_external_job(page: Page, right: str) -> bool:
+    """
+    Scan the right-content panel for signals that this job requires external
+    application. Runs immediately after domcontentloaded — no waiting needed.
+
+    Handshake external postings show buttons like "Apply on employer's website"
+    or "Apply on company website" instead of the standard Handshake apply modal.
+    These never match the normal Apply button selectors, so without this check
+    they'd time out waiting for a button and return no_apply_button.
+    """
+    EXTERNAL_TEXT_SIGNALS = [
+        "apply on employer", "apply on company", "apply externally",
+        "apply on their website", "apply on the employer",
+        "apply on company website", "apply on employer's website",
+        "visit company website", "external application", "apply at",
+        "apply on their site",
+    ]
+    try:
+        for selector in [f"{right} button", f"{right} a"]:
+            elements = await page.query_selector_all(selector)
+            for el in elements:
+                if not await el.is_visible():
+                    continue
+                txt  = (await el.inner_text()).strip().lower()
+                aria = (await el.get_attribute("aria-label") or "").lower()
+                for signal in EXTERNAL_TEXT_SIGNALS:
+                    if signal in txt or signal in aria:
+                        return True
+    except Exception:
+        pass
+    return False
+
+
 async def apply_to_job(page: Page, job: dict) -> str:
     """
     Attempt to apply to a single job. Returns a status string.
@@ -584,27 +812,82 @@ async def apply_to_job(page: Page, job: dict) -> str:
       error                 — something unexpected broke
     """
     try:
-        # Navigate using the same URL pattern Handshake uses internally
+        # Always navigate fresh with the pagination params — this ensures the
+        # right-content detail panel renders fully. Do NOT skip based on
+        # page.url: a prior get_job_description call used a URL without params
+        # that may leave the right panel in an unrendered state.
         job_url = f"{HANDSHAKE_BASE_URL}/job-search/{job['id']}?page=1&per_page=25"
-        if job["id"] not in page.url:
-            await page.goto(job_url, wait_until="domcontentloaded", timeout=30_000)
+        await page.goto(job_url, wait_until="domcontentloaded", timeout=30_000)
+
+        # ── Fast external detection (runs immediately after domcontentloaded) ──
+        # External postings show "Apply on company website"-style buttons that
+        # never match the standard Apply selectors. Without this early check the
+        # bot would wait the full 12 s for a Handshake apply button that will
+        # never appear, then log a misleading no_apply_button error.
+        # We give the right panel 2 s to paint its buttons, then scan.
+        right = "[data-hook='right-content']"
+        try:
+            await page.wait_for_selector(right, timeout=2_000)
+        except PlaywrightTimeout:
+            pass
+        if await _is_external_job(page, right):
+            return "external"
 
         # ── Wait for the right panel to fully render ──────────────────────────
-        # The job detail panel (right column) loads asynchronously after the
-        # left job list renders. We specifically wait for the Apply button
-        # inside the right-content panel, not just any button on the page.
+        # Wait for the Apply button OR the already-applied indicator — whichever
+        # appears first means the right panel is ready.
         try:
             await page.wait_for_selector(
                 "[data-hook='right-content'] button[aria-label='Apply'],"
-                "[data-hook='right-content'] button[aria-label^='Apply to']",
-                timeout=10_000,
+                "[data-hook='right-content'] button[aria-label^='Apply to'],"
+                "[data-hook='right-content'] button[aria-label='Cancel application'],"
+                "[data-hook='right-content'] [data-hook='applied-indicator']",
+                timeout=12_000,
             )
         except PlaywrightTimeout:
-            # Right panel didn't render — fall back to a broader wait
+            # Right panel still didn't render — give it one last chance.
+            # Run the external check one more time before giving up — some slow
+            # pages only paint the external button after the full timeout.
             await page.wait_for_timeout(3000)
+            if await _is_external_job(page, right):
+                return "external"
+
+        # ── Fetch description now that we are on the right page ───────────────
+        # Fetching here (rather than in a separate navigation before this call)
+        # avoids the double-navigation bug where get_job_description would land
+        # on a slightly different URL and leave apply_to_job with a stale page.
+        desc = ""
+        for sel in ["[data-hook='right-content']", "[data-hook='job-description']",
+                    "[class*='description']", "article", "main"]:
+            el = await page.query_selector(sel)
+            if el:
+                text = (await el.inner_text()).strip()
+                if len(text) > 80:
+                    desc = text[:2000]
+                    break
+        job["description"] = desc
 
         # ── Check if already applied ──────────────────────────────────────────
-        if await page.query_selector("button[aria-label='Cancel application']"):
+        # BUG FIX: scope ALL selectors to [data-hook='right-content'].
+        #
+        # Handshake renders a split-pane: the LEFT panel is a scrolling list of
+        # job cards. Any card in that list for a job you previously applied to
+        # shows a "Cancel application" button. The old unscoped selector matched
+        # those left-panel cards and returned "already_applied" for every single
+        # job — even ones that were never applied to.
+        already = (
+            # "Withdraw application" button shown when already applied (from HTML)
+            await page.query_selector(f"{right} button:text('Withdraw application')")
+            # Role-alert banner: "Applied on ..." shown at the top of the right panel
+            or await page.query_selector(f"{right} [role='alert'] h2")
+            # Apply button is disabled (aria-disabled="true") when already applied
+            or await page.query_selector(f"{right} button[aria-disabled='true'][aria-label='Apply']")
+            # Legacy / fallback selectors
+            or await page.query_selector(f"{right} button[aria-label='Cancel application']")
+            or await page.query_selector(f"{right} [aria-label='Applied']")
+            or await page.query_selector(f"{right} [data-hook='applied-indicator']")
+        )
+        if already:
             return "already_applied"
 
         # ── Locate the Apply button ───────────────────────────────────────────
@@ -642,6 +925,10 @@ async def apply_to_job(page: Page, job: dict) -> str:
                     break
 
         if not apply_btn:
+            # One last pass: some external postings render their "Apply on
+            # employer's website" button slowly. Check before giving up.
+            if await _is_external_job(page, right):
+                return "external"
             return "no_apply_button"
 
         # ── Check for external-link indicators ───────────────────────────────
@@ -720,7 +1007,34 @@ async def apply_to_job(page: Page, job: dict) -> str:
                     )
                     if file_input:
                         await file_input.set_input_files(cl_path)
-                        await page.wait_for_timeout(1000)
+                        # Wait for Handshake to process the upload — it renders
+                        # the filename or changes the fieldset text once done.
+                        # A fixed 1 s sleep was too short; some connections take
+                        # 2-3 s to acknowledge the upload before the Submit
+                        # button becomes clickable.
+                        try:
+                            await page.wait_for_function(
+                                """() => {
+                                    const fieldsets = document.querySelectorAll(
+                                        '[data-hook="apply-modal-content"] fieldset'
+                                    );
+                                    for (const fs of fieldsets) {
+                                        const legend = fs.querySelector('legend');
+                                        if (legend && legend.innerText.toLowerCase().includes('cover letter')) {
+                                            const text = fs.innerText.toLowerCase();
+                                            // Handshake shows filename or "replace" once uploaded
+                                            return text.includes('.txt') || text.includes('.pdf')
+                                                   || text.includes('replace') || text.includes('uploaded');
+                                        }
+                                    }
+                                    return false;
+                                }""",
+                                timeout=8_000,
+                            )
+                        except PlaywrightTimeout:
+                            # Upload acknowledgment never appeared — wait a bit
+                            # longer as a safety net before continuing.
+                            await page.wait_for_timeout(3_000)
                         ok(f"  Cover letter uploaded")
 
         # ── Free-text questions ───────────────────────────────────────────────
@@ -730,23 +1044,45 @@ async def apply_to_job(page: Page, job: dict) -> str:
         if filled:
             ai(f"  Groq answered {filled} question(s)")
 
-        # ── Submit ────────────────────────────────────────────────────────────
-        # Try the most specific selector first, then broaden
-        submit_btn = None
-        for selector in [
-            "[data-hook='apply-modal-content'] button:has-text('Submit Application')",
-            "[data-hook='apply-modal-content'] button:has-text('Submit')",
-            "[data-hook='apply-modal-content'] button:has-text('Apply')",
-        ]:
-            submit_btn = await page.query_selector(selector)
-            if submit_btn and await submit_btn.is_visible():
-                break
+        # ── Detect fields needing manual input ────────────────────────────────
+        # Scan the modal for anything the bot cannot fill: transcript uploads,
+        # GitHub/portfolio URLs, other file uploads, or unfilled required fields.
+        manual_fields = await detect_manual_fields(page)
 
-        if not submit_btn:
-            return "no_submit_button"
+        user_submitted = False
+        if manual_fields:
+            print()
+            warn(f"  ⏸  Manual input needed for: {job['title']} @ {job['company']}")
+            for field in manual_fields:
+                warn(f"      {field}")
+            warn(f"  Fill the highlighted fields in the browser, then either:")
+            warn(f"    • Press ENTER here to let the bot click Submit, OR")
+            print()
 
-        await submit_btn.click()
-        await page.wait_for_timeout(2500)   # give Handshake time to process
+            outcome = await wait_for_enter_or_submit(page)
+            if outcome == "user_submitted":
+                ok(f"  Detected browser submission — continuing.")
+                user_submitted = True
+            else:
+                ok(f"  ENTER received — bot will click Submit now.")
+
+        # ── Submit (only if the user hasn't already clicked it themselves) ────
+        if not user_submitted:
+            submit_btn = None
+            for selector in [
+                "[data-hook='apply-modal-content'] button:has-text('Submit Application')",
+                "[data-hook='apply-modal-content'] button:has-text('Submit')",
+                "[data-hook='apply-modal-content'] button:has-text('Apply')",
+            ]:
+                submit_btn = await page.query_selector(selector)
+                if submit_btn and await submit_btn.is_visible():
+                    break
+
+            if not submit_btn:
+                return "no_submit_button"
+
+            await submit_btn.click()
+            await page.wait_for_timeout(2500)   # give Handshake time to process
 
         # ── Confirm success ───────────────────────────────────────────────────
         success = (
@@ -757,6 +1093,22 @@ async def apply_to_job(page: Page, job: dict) -> str:
         return "applied" if success else "submitted_unconfirmed"
 
     except PlaywrightTimeout:
+        # Before declaring a timeout, check whether the page actually shows an
+        # already-applied state. Some jobs (e.g. external or slow-loading ones)
+        # time out on the wait_for_selector but the page is fully loaded and
+        # already shows "Applied" or a disabled Apply button.
+        try:
+            right = "[data-hook='right-content']"
+            already = (
+                await page.query_selector(f"{right} button:text('Withdraw application')")
+                or await page.query_selector(f"{right} [role='alert'] h2")
+                or await page.query_selector(f"{right} button[aria-disabled='true'][aria-label='Apply']")
+                or await page.query_selector(f"{right} button[aria-label='Cancel application']")
+            )
+            if already:
+                return "already_applied"
+        except Exception:
+            pass
         return "timeout"
     except Exception as ex:
         err(f"  Exception on {job['url']}: {ex}")
@@ -851,6 +1203,7 @@ async def run():
 
         applied_count  = 0
         external_count = 0
+        no_button_count = 0
         error_count    = 0
 
         for job in pending:
@@ -858,10 +1211,9 @@ async def run():
                 warn(f"Hit the MAX_APPLICATIONS limit ({MAX_APPLICATIONS}). Stopping.")
                 break
 
-            # Fetch the job description so Groq has context for cover letters
-            # and free-text answers during the application
-            job["description"] = await get_job_description(page, job["url"])
-
+            # Description is now fetched inside apply_to_job after navigating,
+            # so we don't do a separate navigation here that leaves the page in
+            # a half-ready state before apply_to_job runs.
             label = f"{job['title']} @ {job['company']}"
             info(f"Applying → {label}")
 
@@ -887,6 +1239,19 @@ async def run():
                 tracker.record(job["id"], job["title"], job["company"], "external_link")
                 external_count += 1
 
+            elif status == "no_modal":
+                # Clicking Apply opened an external tab instead of a modal
+                warn(f"External (opened outside Handshake): {label}")
+                tracker.record(job["id"], job["title"], job["company"], "external_link")
+                external_count += 1
+
+            elif status == "no_apply_button":
+                # Likely an external posting whose button text wasn't detected,
+                # or a Handshake UI variant we don't handle yet.
+                warn(f"No apply button (check manually): {label}")
+                tracker.record(job["id"], job["title"], job["company"], "no_apply_button")
+                no_button_count += 1
+
             else:
                 err(f"Error ({status}): {label}")
                 tracker.record(job["id"], job["title"], job["company"], f"error:{status}")
@@ -899,6 +1264,7 @@ async def run():
   ✓  Applied               : {applied_count}
   →  Skipped (already done): {skipped_count}
   ↗  External (manual)     : {external_count}
+  ⊘  No apply button       : {no_button_count}
   ✗  Errors                : {error_count}
   ✦  Model used            : Groq / {GROQ_MODEL}
   📄 Full log              : {TRACKER_FILE}

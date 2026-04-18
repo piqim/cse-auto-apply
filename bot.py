@@ -40,7 +40,7 @@ GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "YOUR_API_KEY_HERE")
 # What to search on Handshake. Each keyword runs as its own search.
 KEYWORDS = [
     "data science",
-    "data engineering",
+    #"data engineering",
     #"software engineering",
     #"computer science",
     #"fullstack developer",
@@ -57,7 +57,7 @@ KEYWORDS = [
 # lower it if you want to cast a wider net.
 MAX_APPLICATIONS   = 25     # hard stop — won't submit more than this per run
 MAX_PAGES          = 5      # pages to scrape per keyword (25 results each = up to 125 per keyword)
-DELAY_BETWEEN_APPS = 2      # seconds between each application, don't be rude
+DELAY_BETWEEN_APPS = 4      # seconds between each application, don't be rude
 TRACKER_FILE       = "applied_jobs.csv"
 DRY_RUN            = False  # set True to scrape without submitting
 
@@ -1007,11 +1007,23 @@ async def apply_to_job(page: Page, job: dict) -> str:
                     )
                     if file_input:
                         await file_input.set_input_files(cl_path)
-                        # Wait for Handshake to process the upload — it renders
-                        # the filename or changes the fieldset text once done.
-                        # A fixed 1 s sleep was too short; some connections take
-                        # 2-3 s to acknowledge the upload before the Submit
-                        # button becomes clickable.
+
+                        # ── Phase 1: wait for filename to appear ──────────────
+                        # Handshake renders the filename (or "replace") in the
+                        # fieldset once it has received the file bytes.
+                        CL_FIELDSET_JS = """
+                            () => {
+                                const fieldsets = document.querySelectorAll(
+                                    '[data-hook="apply-modal-content"] fieldset'
+                                );
+                                for (const fs of fieldsets) {
+                                    const legend = fs.querySelector('legend');
+                                    if (legend && legend.innerText.toLowerCase().includes('cover letter'))
+                                        return fs;
+                                }
+                                return null;
+                            }
+                        """
                         try:
                             await page.wait_for_function(
                                 """() => {
@@ -1022,7 +1034,6 @@ async def apply_to_job(page: Page, job: dict) -> str:
                                         const legend = fs.querySelector('legend');
                                         if (legend && legend.innerText.toLowerCase().includes('cover letter')) {
                                             const text = fs.innerText.toLowerCase();
-                                            // Handshake shows filename or "replace" once uploaded
                                             return text.includes('.txt') || text.includes('.pdf')
                                                    || text.includes('replace') || text.includes('uploaded');
                                         }
@@ -1032,10 +1043,41 @@ async def apply_to_job(page: Page, job: dict) -> str:
                                 timeout=8_000,
                             )
                         except PlaywrightTimeout:
-                            # Upload acknowledgment never appeared — wait a bit
-                            # longer as a safety net before continuing.
                             await page.wait_for_timeout(3_000)
-                        ok(f"  Cover letter uploaded")
+
+                        # ── Phase 2: wait for "converting" to finish ──────────
+                        # After the filename appears, Handshake converts the file
+                        # server-side and shows a "Converting..." spinner. The
+                        # Submit button stays disabled until this clears. We poll
+                        # until the word "converting" is gone from the fieldset.
+                        ai(f"  Waiting for cover letter conversion...")
+                        try:
+                            await page.wait_for_function(
+                                """() => {
+                                    const fieldsets = document.querySelectorAll(
+                                        '[data-hook="apply-modal-content"] fieldset'
+                                    );
+                                    for (const fs of fieldsets) {
+                                        const legend = fs.querySelector('legend');
+                                        if (legend && legend.innerText.toLowerCase().includes('cover letter')) {
+                                            const text = fs.innerText.toLowerCase();
+                                            // Still converting — keep waiting
+                                            if (text.includes('converting')) return false;
+                                            // No filename yet either — keep waiting
+                                            if (!text.includes('.txt') && !text.includes('.pdf')
+                                                && !text.includes('replace') && !text.includes('uploaded'))
+                                                return false;
+                                            return true;
+                                        }
+                                    }
+                                    // Fieldset gone — assume done
+                                    return true;
+                                }""",
+                                timeout=30_000,   # conversion can be slow on bad connections
+                            )
+                        except PlaywrightTimeout:
+                            warn(f"  Cover letter conversion timed out — submitting anyway")
+                        ok(f"  Cover letter ready")
 
         # ── Free-text questions ───────────────────────────────────────────────
         filled = await fill_text_fields(

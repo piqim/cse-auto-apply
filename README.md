@@ -14,10 +14,12 @@ Is this lazy? Yes. Is it also the most efficient thing I've built this semester?
 
 1. **Scrapes** Handshake for internship postings across your keyword list, paginating through up to `MAX_PAGES` pages per keyword
 2. **Deduplicates** results — the same posting can appear across multiple keywords and pages, it only gets applied to once
-3. **Applies** to each new job automatically — clicks the Apply button, handles the modal, submits
-4. **Generates cover letters** on the fly using Groq when an application asks for one — fresh, tailored to the specific job
-5. **Auto-fills free-text questions** ("Why are you interested?", "Describe your experience") using your `CANDIDATE_PROFILE` + the job description
-6. **Logs** every outcome — applied, already applied, external link, error — to `applied_jobs.csv`
+3. **Detects external postings immediately** — jobs that redirect off Handshake are flagged right after page load, before any long waits
+4. **Applies** to each new job automatically — clicks the Apply button, handles the modal, submits
+5. **Generates cover letters** on the fly using Groq when an application asks for one — fresh, tailored to the specific job — and waits for Handshake to fully convert the file before submitting
+6. **Auto-fills free-text questions** ("Why are you interested?", "Describe your experience") using your `CANDIDATE_PROFILE` + the job description
+7. **Pauses for manual fields** — if an application requires a transcript, portfolio URL, or other input the bot can't fill, it lists exactly what's needed and waits for you to fill it before submitting
+8. **Logs** every outcome — applied, already applied, external link, no apply button, error — to `applied_jobs.csv`
 
 Your resume is already attached from your Handshake profile — no upload needed. For external applications (the ones that redirect off Handshake), the bot flags them in the CSV for manual follow-up.
 
@@ -88,10 +90,30 @@ Every job the bot encounters gets a row in `applied_jobs.csv`:
 | `job_id` | Handshake's internal job ID |
 | `title` | Job title |
 | `company` | Company name |
-| `status` | `applied`, `submitted_unconfirmed`, `already_applied`, `external_link`, `error:*` |
+| `status` | `applied`, `submitted_unconfirmed`, `already_applied`, `external_link`, `no_apply_button`, `error:*` |
 | `applied_at` | Timestamp |
 
 Re-run the bot anytime — it reads the CSV on startup and skips anything already logged.
+
+---
+
+## Run summary
+
+At the end of each run the bot prints a breakdown:
+
+```
+══════════════════════ RUN COMPLETE ══════════════════════
+  ✓  Applied               : 25
+  →  Skipped (already done): 5
+  ↗  External (manual)     : 8
+  ⊘  No apply button       : 2
+  ✗  Errors                : 1
+  ✦  Model used            : Groq / llama-3.3-70b-versatile
+  📄 Full log              : applied_jobs.csv
+══════════════════════════════════════════════════════════
+```
+
+**External** includes both postings that were detected as external before clicking (e.g. "Apply on employer's website") and ones where clicking Apply opened an external tab instead of a Handshake modal. **No apply button** means no recognisable apply button was found at all — usually a Handshake eligibility mismatch or an unusual posting layout, worth checking manually.
 
 ---
 
@@ -109,11 +131,15 @@ The `CANDIDATE_PROFILE` is what Groq draws from when writing. Generic input → 
 
 **Bot finds 0 jobs** — Handshake occasionally updates their frontend, which can break the card selector (`data-hook^="job-result-card | "`). Open devtools on the job search page, inspect a card, and check if the data-hook format has changed. Let me know and I'll update the selector.
 
-**"no_apply_button" in the CSV** — The Apply button selector (`button[aria-label^='Apply']`) didn't match. Handshake sometimes renders the button differently depending on your eligibility for a job (e.g. graduation year mismatch). Check the job manually to see what the button actually looks like.
+**"no_apply_button" in the CSV** — Either the job is external but used unusual button text that slipped past the detector, or your eligibility for the posting was flagged (e.g. graduation year mismatch) and Handshake rendered a different UI. Check the job manually.
 
 **"submitted_unconfirmed" in the CSV** — The bot submitted but couldn't find a success indicator. Check your Handshake Applications tab to verify. This usually means it went through — Handshake's confirmation UI is inconsistent across postings.
 
 **Cover letter field not detected** — The bot looks for a fieldset with "cover letter" in its legend text. If a job uses different label text, it'll be skipped. Not a dealbreaker — the application still submits, just without the cover letter attached.
+
+**Cover letter conversion warning in the terminal** — Handshake converts uploaded files server-side after upload. The bot waits up to 30 seconds for conversion to finish before submitting. If you see a timeout warning, it submitted anyway — check your Applications tab to confirm the cover letter came through.
+
+**Bot paused asking for manual input** — Some applications require a transcript, GitHub URL, or portfolio upload that the bot can't fill automatically. It'll list exactly which fields need attention and wait. Fill them in the browser, then press ENTER in the terminal to let the bot click Submit.
 
 ---
 

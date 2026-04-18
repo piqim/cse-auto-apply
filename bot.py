@@ -24,10 +24,14 @@ from datetime import datetime
 from pathlib import Path
 
 from playwright.async_api import async_playwright, Page, TimeoutError as PlaywrightTimeout
+from dotenv import load_dotenv
 
 
 # ── CONFIG ────────────────────────────────────────────────────────────────────
 # Everything you'd want to change is here. Don't touch anything below this.
+
+# Load variables from .env (if present) before reading config values.
+load_dotenv()
 
 # Free key at https://console.groq.com — or set via: export GROQ_API_KEY='gsk_...'
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "YOUR_API_KEY_HERE")
